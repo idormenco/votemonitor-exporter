@@ -34,6 +34,7 @@ This project downloads election form submissions, quick reports, and related att
    ADMIN_EMAIL=<admin-email>
    ADMIN_PASSWORD=<admin-password>
    ELECTION_ID=<election-id>
+   DOWNLOAD_ATTACHMENTS=false | true
 6. Running the script
 
    Please run the script at least every **15 minutes**
