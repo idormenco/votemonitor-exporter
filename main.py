@@ -19,6 +19,7 @@ error_console = Console(stderr=True, style="bold red")
 os.makedirs(os.path.join('exported-data', os.getenv("ELECTION_ID")), exist_ok=True)
 db_path = os.path.join('exported-data', os.getenv("DB_FILE"))
 JWT = ""
+download_attachments = os.getenv("DOWNLOAD_ATTACHMENTS", "").lower() == "true"
 
 CREATE_TABLES_SQL = [
     """
@@ -349,6 +350,8 @@ async def store_submission_data(submission):
             "submissionId": submission["submissionId"],  # Link to the main submission
             "questionId": attachment["questionId"],
             "path": get_local_submission_attachment_path(submission["submissionId"], attachment)
+            if download_attachments
+            else attachment["presignedUrl"]
         }
 
         mapped_attachments.append(mapped_attachment)
@@ -427,6 +430,8 @@ async def store_quick_report_data(quick_report):
         mapped_attachment = {
             "quickReportId": quick_report["id"],  # Link to the main submission
             "path": get_local_quick_report_attachment_path(quick_report["id"], attachment)
+            if download_attachments
+            else attachment["presignedUrl"]
         }
 
         mapped_attachments.append(mapped_attachment)
@@ -435,10 +440,8 @@ async def store_quick_report_data(quick_report):
                        INSERT INTO quick_report_attachments (quickReportId, path)
                        VALUES (:quickReportId, :path)
                        """, mapped_attachment)
-
     conn.commit()
     conn.close()
-
     return quick_report.update({"mapped_attachments": mapped_attachments})
 
 
@@ -458,7 +461,7 @@ async def download_submission_data(submission):
         await store_submission_data(submission_data)
 
         attachments = submission_data.get("attachments", [])
-        if len(attachments) > 0:
+        if len(attachments) > 0 and download_attachments:
             for attachment in track(attachments,
                                     description=f"[cyan]Downloading attachments for submission {submission_id}..."):
                 await download_submission_attachment(submission, attachment)
@@ -733,12 +736,12 @@ async def export_form_submissions(forms, submissions):
 
         # --- Write headers ---
         for col, header in enumerate(form_headers):
-            form_worksheet.write(0, col, header)
+            form_worksheet.write_string(0, col, header)
 
         # --- Write data rows ---
         for row_idx, row_data in enumerate(rows, start=1):
             for col_idx, cell_value in enumerate(row_data):
-                form_worksheet.write(row_idx, col_idx, cell_value)
+                form_worksheet.writewrite_string(row_idx, col_idx, cell_value or "")
 
     workbook.close()
 
@@ -812,10 +815,13 @@ async def download_quick_report_data(quick_report):
         await store_quick_report_data(quick_report_data)
 
         attachments = quick_report_data.get("attachments", [])
-        if len(attachments) > 0:
+        if len(attachments) > 0 and download_attachments:
             for attachment in track(attachments,
                                     description=f"[cyan]Downloading attachments for quick report {quick_report_id}..."):
                 await download_quick_report_attachment(quick_report, attachment)
+
+        return quick_report_data
+
 
 async def export_quick_reports(quick_reports):
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -855,39 +861,38 @@ async def export_quick_reports(quick_reports):
     # Build all rows
     rows = []
     for qr in quick_reports:
-        attachments = "\n".join(map(lambda a : a["path"],qr.get("mapped_attachments", [])))
+        attachments = "\n\n".join(map(lambda a: a["path"], qr.get("mapped_attachments", [])))
         row_data = [
-            qr.get("quickReportId",""),
-            qr.get("timeSubmitted",""),
-            qr.get("followUpStatus",""),
-            qr.get("incidentCategory",""),
-            qr.get("ngo",""),
-            qr.get("monitoringObserverId",""),
-            qr.get("name",""),
-            qr.get("email",""),
-            qr.get("phoneNumber",""),
-            qr.get("locationType",""),
-            qr.get("level1",""),
-            qr.get("level2",""),
-            qr.get("level3",""),
-            qr.get("level4",""),
-            qr.get("level5",""),
-            qr.get("levelNumber",""),
-            qr.get("pollingStationDetails",""),
-            qr.get("title",""),
-            qr.get("description",""),
+            qr.get("quickReportId", ""),
+            qr.get("timeSubmitted", ""),
+            qr.get("followUpStatus", ""),
+            qr.get("incidentCategory", ""),
+            qr.get("ngo", ""),
+            qr.get("monitoringObserverId", ""),
+            qr.get("name", ""),
+            qr.get("email", ""),
+            qr.get("phoneNumber", ""),
+            qr.get("locationType", ""),
+            qr.get("level1", ""),
+            qr.get("level2", ""),
+            qr.get("level3", ""),
+            qr.get("level4", ""),
+            qr.get("level5", ""),
+            qr.get("levelNumber", ""),
+            qr.get("pollingStationDetails", ""),
+            qr.get("title", ""),
+            qr.get("description", ""),
             attachments
         ]
         rows.append(row_data)
 
-
-
     # --- Write data rows ---
     for row_idx, row_data in enumerate(rows, start=1):
         for col_idx, cell_value in enumerate(row_data):
-            worksheet.write(row_idx, col_idx, cell_value)
+            worksheet.write_string(row_idx, col_idx, cell_value or "")
 
     workbook.close()
+
 
 async def download_quick_reports():
     all_quick_reports = []
@@ -941,7 +946,7 @@ async def download_quick_reports():
 async def main():
     ensure_db()
     await log_in()
-    # await download_form_submissions()
+    await download_form_submissions()
     await download_quick_reports()
 
 
