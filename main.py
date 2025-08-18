@@ -11,6 +11,7 @@ import json
 from datetime import datetime
 import xlsxwriter
 from collections import defaultdict
+import re
 
 load_dotenv()
 
@@ -632,6 +633,15 @@ def build_answers(questions_options_dict, question, answers, attachments_by_ques
             return ["unknown value", notes, attachments]
 
 
+def clean_sheet_name(name: str) -> str:
+    # Remove invalid characters
+    name = re.sub(r'[\[\]\:\*\?\/\\]', '', name)
+
+    # Trim to max length (31)
+    name = name[:31].strip()
+
+    return name
+
 async def export_form_submissions(forms, submissions):
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     filename = f"submissions_{timestamp}.xlsx"
@@ -657,9 +667,9 @@ async def export_form_submissions(forms, submissions):
     ]
 
     for idx, form in enumerate(forms, start=1):
-        sheet_name = (
+        sheet_name = clean_sheet_name(
             f"{idx}_PSI" if form["formType"] == 'PSI'
-            else f"{idx}_{form['name'][form['defaultLanguage']][:31]}"
+            else f"{idx}_{form['name'][form['defaultLanguage']]}"[:31]
         )
 
         form_worksheet = workbook.add_worksheet(sheet_name)
@@ -736,12 +746,12 @@ async def export_form_submissions(forms, submissions):
 
         # --- Write headers ---
         for col, header in enumerate(form_headers):
-            form_worksheet.write_string(0, col, header)
+            form_worksheet.write_string(0, col, str(header))
 
         # --- Write data rows ---
         for row_idx, row_data in enumerate(rows, start=1):
             for col_idx, cell_value in enumerate(row_data):
-                form_worksheet.writewrite_string(row_idx, col_idx, cell_value or "")
+                form_worksheet.write_string(row_idx, col_idx, str(cell_value or ""))
 
     workbook.close()
 
@@ -889,7 +899,7 @@ async def export_quick_reports(quick_reports):
     # --- Write data rows ---
     for row_idx, row_data in enumerate(rows, start=1):
         for col_idx, cell_value in enumerate(row_data):
-            worksheet.write_string(row_idx, col_idx, cell_value or "")
+            worksheet.write_string(row_idx, col_idx, str(cell_value or ""))
 
     workbook.close()
 
