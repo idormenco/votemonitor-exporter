@@ -125,7 +125,7 @@ CREATE_TABLES_SQL = [
     )
     """,
     """
-    CREATE TABLE quick_reports
+    CREATE TABLE IF NOT EXISTS quick_reports
     (
         id                      TEXT PRIMARY KEY NOT NULL,
         electionRoundId         TEXT             NOT NULL,
@@ -167,7 +167,7 @@ CREATE_TABLES_SQL = [
     )
     """,
     """
-    CREATE TABLE forms
+    CREATE TABLE IF NOT EXISTS forms
     (
         id                         TEXT PRIMARY KEY NOT NULL,
         electionRoundId            TEXT             NOT NULL,
