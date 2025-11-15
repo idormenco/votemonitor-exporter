@@ -5,7 +5,6 @@ import re
 from typing import Any, Dict, Optional, List
 from urllib.parse import urljoin
 
-import aiofiles
 import httpx
 from dotenv import load_dotenv
 from rich.console import Console
@@ -14,6 +13,8 @@ import xlsxwriter
 from datetime import datetime
 import gspread
 from google.oauth2.service_account import Credentials
+from textual.widgets import data_table
+from zoneinfo import ZoneInfo
 
 load_dotenv()
 
@@ -42,7 +43,14 @@ os.makedirs(EXPORT_ROOT, exist_ok=True)
 
 # Google
 GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "")
-GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")
+FS_GOOGLE_DOC_ID = os.getenv("FS_GOOGLE_DOC_ID", "")
+QR_GOOGLE_DOC_ID = os.getenv("QR_GOOGLE_DOC_ID", "")
+scopes = ['https://www.googleapis.com/auth/spreadsheets']
+credentials = Credentials.from_service_account_file(GOOGLE_CREDENTIALS_PATH, scopes=scopes)
+gdocs_client = gspread.authorize(credentials)
+
+ZONE_INFO = ZoneInfo(os.getenv("ZONE_INFO", "Etc/UTC"))
+
 # ----------------------------------------------------------------------------------
 
 # ---------------------------
@@ -55,13 +63,13 @@ def clean_sheet_name(name: str) -> str:
     return name[:31].strip()
 
 
-def local_submission_attachment_path(submission_id: str, attachment: Dict[str, Any]) -> str:
-    return os.path.abspath(os.path.join(EXPORT_ROOT, f"submission-{submission_id}", attachment["uploadedFileName"]))
+def local_submission_attachment_path(attachment: Dict[str, Any]) -> str:
+    return os.path.abspath(os.path.join(EXPORT_ROOT, 'submission-attachments', attachment["uploadedFileName"]))
 
 
-def local_quick_report_attachment_path(quick_report_id: str, attachment: Dict[str, Any]) -> str:
+def local_quick_report_attachment_path(attachment: Dict[str, Any]) -> str:
     return os.path.abspath(
-        os.path.join(EXPORT_ROOT, f"quick-reports-{quick_report_id}", attachment["uploadedFileName"]))
+        os.path.join(EXPORT_ROOT, f"quick-report-attachments", attachment["uploadedFileName"]))
 
 
 # ---------------------------
@@ -73,15 +81,20 @@ async def fetch_json(client: httpx.AsyncClient, url: str, params: Optional[Dict[
     return resp.json()
 
 
-async def download_binary(client: httpx.AsyncClient, url: str, target_path: str) -> None:
-    # Write binary to disk with aiofiles to avoid blocking loop
+async def download_binary(url: str, target_path):
     if os.path.exists(target_path):
         return
+
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
-    resp = await client.get(url)
-    resp.raise_for_status()
-    async with aiofiles.open(target_path, "wb") as f:
-        await f.write(resp.content)
+
+    if not os.path.exists(target_path):
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, timeout=None)
+            response.raise_for_status()  # Raise error if request failed
+
+            # Write content to file
+            with open(target_path, "wb") as f:
+                f.write(response.content)
 
 
 # ---------------------------
@@ -96,7 +109,6 @@ async def log_in(client: httpx.AsyncClient) -> None:
     JWT = resp.json().get("token")
     # Attach token header to client for reuse
     client.headers.update({"Authorization": f"Bearer {JWT}"})
-    console.log("Logged in successfully.")
 
 
 # ---------------------------
@@ -117,32 +129,31 @@ async def fetch_submission_detail(client: httpx.AsyncClient, submission_id: str,
 
 async def fetch_form_detail(client: httpx.AsyncClient, form_id: str, progress,
                             task) -> Dict[str, Any]:
-    # console.log(f"Downloading form {form_id}")
     url = urljoin(BASE_API_URL, f"/api/election-rounds/{ELECTION_ID}/forms/{form_id}")
     form = await fetch_json(client, url)
     progress.update(task, advance=1)
     return form
 
 
-async def fetch_quick_report_detail(client: httpx.AsyncClient, quick_report_id: str, progress,
+async def fetch_quick_report_detail(client: httpx.AsyncClient, quick_report_id: str, sem: asyncio.Semaphore, progress,
                                     task) -> Dict[str, Any]:
-    # console.log(f"Downloading quick report {quick_report_id}")
     url = urljoin(BASE_API_URL, f"/api/election-rounds/{ELECTION_ID}/quick-reports/{quick_report_id}")
-    quick_report = await fetch_json(client, url)
-    progress.update(task, advance=1)
-    return quick_report
+    async with sem:
+        try:
+            quick_report = await fetch_json(client, url)
+            progress.update(task, advance=1)
+            return quick_report
+        except Exception as e:
+            error_console.log(f"Failed to download submission {quick_report_id}: {e}")
 
 
-# ---------------------------
-# Pagination helper
-# ---------------------------
-async def fetch_all_paginated(client: httpx.AsyncClient, params_extra: Optional[Dict[str, Any]] = None) -> List[
+async def fetch_all_form_submissions(client: httpx.AsyncClient, params_extra: Optional[Dict[str, Any]] = None) -> List[
     Dict[str, Any]]:
     url = urljoin(BASE_API_URL, f"/api/election-rounds/{ELECTION_ID}/form-submissions:byEntry")
 
     page_number = 1
     page_size = 100
-    all_items: List[Dict[str, Any]] = []
+    form_submissions: List[Dict[str, Any]] = []
     params_extra = params_extra or {}
     while True:
         params = {**params_extra, "pageNumber": page_number, "pageSize": page_size, "dataSource": "Coalition"}
@@ -150,11 +161,32 @@ async def fetch_all_paginated(client: httpx.AsyncClient, params_extra: Optional[
         resp.raise_for_status()
         data = resp.json()
         items = data.get("items", [])
-        all_items.extend(items)
+        form_submissions.extend(items)
         if len(items) < page_size:
             break
         page_number += 1
-    return all_items
+    return form_submissions
+
+
+async def fetch_all_quick_reports(client: httpx.AsyncClient, params_extra: Optional[Dict[str, Any]] = None) -> List[
+    Dict[str, Any]]:
+    url = urljoin(BASE_API_URL, f"/api/election-rounds/{ELECTION_ID}/quick-reports")
+
+    page_number = 1
+    page_size = 100
+    quick_reports: List[Dict[str, Any]] = []
+    params_extra = params_extra or {}
+    while True:
+        params = {**params_extra, "pageNumber": page_number, "pageSize": page_size, "dataSource": "Coalition"}
+        resp = await client.get(url, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        items = data.get("items", [])
+        quick_reports.extend(items)
+        if len(items) < page_size:
+            break
+        page_number += 1
+    return quick_reports
 
 
 def get_question_answer(question, answers, attachments_by_question, notes_by_question,
@@ -231,8 +263,54 @@ def get_question_answer(question, answers, attachments_by_question, notes_by_que
             return [answer["value"], notes, attachments]
     return ["unknown value", notes, attachments]
 
+def map_submission_follow_up_status(follow_up_status):
+    status_map = {
+        "NotApplicable": "Not Applicable",
+        "NeedsFollowUp": "Needs Follow-up",
+        "Resolved": "Resolved",
+    }
 
-def prepare_data_for_export(forms: List[Dict[str, Any]], submissions: List[Dict[str, Any]]):
+    return status_map.get(follow_up_status, follow_up_status)
+
+def map_quick_report_incident_category(incident_category):
+    incident_category_map = {
+      "PhysicalViolenceIntimidationPressure": "Physical violence/intimidation/pressure",
+      "CampaigningAtPollingStation": "Campaigning at the polling station",
+      "RestrictionOfObserversRights": "Restriction of observer's (representative's/media) rights",
+      "UnauthorizedPersonsAtPollingStation": "Unauthorized person(s) at the polling station",
+      "ViolationDuringVoterVerificationProcess": "Violation during voter verification process",
+      "VotingWithImproperDocumentation": "Voting with improper documentation",
+      "IllegalRestrictionOfVotersRightToVote": "Illegal restriction of voter's right to vote",
+      "DamagingOrSeizingElectionMaterials": "Damaging of/seizing election materials",
+      "ImproperFilingOrHandlingOfElectionDocumentation": "Improper filing/handling of election documentation",
+      "BallotStuffing": "Ballot stuffing",
+      "ViolationsRelatedToControlPaper": "Violations related to the control paper",
+      "NotCheckingVoterIdentificationSafeguardMeasures": "Not checking the voter identification safeguard measures",
+      "VotingWithoutVoterIdentificationSafeguardMeasures": "Voting without voter identification safeguard measures",
+      "BreachOfSecrecyOfVote": "Breach of secrecy of vote",
+      "ViolationsRelatedToMobileBallotBox": "Violations related to the mobile ballot box",
+      "NumberOfBallotsExceedsNumberOfVoters": "Number of ballots exceed the number of voters",
+      "ImproperInvalidationOrValidationOfBallots": "Improper invalidation / validation of ballots",
+      "FalsificationOrImproperCorrectionOfFinalProtocol": "Falsification / improper correction of the final protocol",
+      "RefusalToIssueCopyOfFinalProtocolOrIssuingImproperCopy": "Refusal to issue a copy of the final protocol/issuing an improper copy",
+      "ImproperFillingInOfFinalProtocol": "Improper filling in of the final protocol",
+      "ViolationOfSealingProceduresOfElectionMaterials": "Violation of the sealing procedures of the election materials",
+      "ViolationsRelatedToVoterLists": "Violations related to the voter lists",
+      "Other": "Other"
+    }
+
+    return incident_category_map.get(incident_category, incident_category)
+
+def map_quick_report_location_type(location_type):
+    location_type_map = {
+      "NotRelatedToAPollingStation": "Not Related To A Polling Station",
+      "OtherPollingStation": "Other Polling Station",
+      "VisitedPollingStation": "Visited Polling Station"
+    }
+
+    return location_type_map.get(location_type, location_type)
+
+def submissions_to_data_table(forms: List[Dict[str, Any]], submissions: List[Dict[str, Any]]):
     default_headers = [
         "SubmissionId",
         "TimeSubmitted",
@@ -243,7 +321,6 @@ def prepare_data_for_export(forms: List[Dict[str, Any]], submissions: List[Dict[
         "Level4",
         "Level5",
         "Number",
-        "Ngo",
         "MonitoringObserverId",
         "Name",
         "Email",
@@ -252,10 +329,10 @@ def prepare_data_for_export(forms: List[Dict[str, Any]], submissions: List[Dict[
 
     forms_data = {}
     forms.sort(
-            key=lambda f: (
-                    0 if f["name"][f["defaultLanguage"]].strip().lower() == "psi" else 1,
-                    f["name"][f["defaultLanguage"]].strip().lower()
-            )
+        key=lambda f: (
+            0 if f["name"][f["defaultLanguage"]].strip().lower() == "psi" else 1,
+            f["name"][f["defaultLanguage"]].strip().lower()
+        )
     )
 
     for idx, form in enumerate(forms, start=1):
@@ -273,17 +350,20 @@ def prepare_data_for_export(forms: List[Dict[str, Any]], submissions: List[Dict[
 
         data = [form_headers]
         for fs in form_submissions:
+            timeSubmitted_utc = datetime.fromisoformat(fs.get("timeSubmitted", "").replace("Z", "+00:00"))
+
+            # Convert from UTC to specified timezone
+            timeSubmitted = timeSubmitted_utc.astimezone(ZONE_INFO)
             row_data = [
                 fs.get("submissionId", ""),
-                fs.get("timeSubmitted", ""),
-                fs.get("followUpStatus", ""),
+                timeSubmitted,
+                map_submission_follow_up_status(fs.get("followUpStatus", "")),
                 fs.get("level1", ""),
                 fs.get("level2", ""),
                 fs.get("level3", ""),
                 fs.get("level4", ""),
                 fs.get("level5", ""),
                 fs.get("number", ""),
-                fs.get("ngo", ""),
                 fs.get("monitoringObserverId", ""),
                 fs.get("observerName", ""),
                 fs.get("email", ""),
@@ -315,6 +395,61 @@ def prepare_data_for_export(forms: List[Dict[str, Any]], submissions: List[Dict[
     return forms_data
 
 
+def quick_reports_to_data_table(quick_reports):
+    data_table = [[
+        "QuickReportId",
+        "TimeSubmitted",
+        "FollowUpStatus",
+        "IncidentCategory",
+        "MonitoringObserverId",
+        "Name",
+        "Email",
+        "PhoneNumber",
+        "LocationType",
+        "Level1",
+        "Level2",
+        "Level3",
+        "Level4",
+        "Level5",
+        "LevelNumber",
+        "PollingStationDetails",
+        "Title",
+        "Description",
+        "Attachments",
+    ]]
+
+    for qr in quick_reports:
+        attachments = "\n\n".join(map(lambda a: a["presignedUrl"], qr.get("attachments", [])))
+        timeSubmitted_utc = datetime.fromisoformat(qr.get("timestamp", "").replace("Z", "+00:00"))
+
+        # Convert from UTC to specified timezone
+        timeSubmitted = timeSubmitted_utc.astimezone(ZONE_INFO)
+        row_data = [
+            qr.get("id", ""),
+            timeSubmitted,
+            map_submission_follow_up_status(qr.get("followUpStatus", "")),
+            map_quick_report_incident_category(qr.get("incidentCategory", "")),
+            qr.get("monitoringObserverId", ""),
+            qr.get("name", ""),
+            qr.get("email", ""),
+            qr.get("phoneNumber", ""),
+            map_quick_report_location_type(qr.get("quickReportLocationType", "")),
+            qr.get("level1", ""),
+            qr.get("level2", ""),
+            qr.get("level3", ""),
+            qr.get("level4", ""),
+            qr.get("level5", ""),
+            qr.get("levelNumber", ""),
+            qr.get("pollingStationDetails", ""),
+            qr.get("title", ""),
+            qr.get("description", ""),
+            attachments
+        ]
+        data_table.append(row_data)
+
+    return data_table
+
+
 async def write_submissions_to_excel(forms_data):
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
     filename = f"form_submissions_{timestamp}.xlsx"
@@ -331,104 +466,209 @@ async def write_submissions_to_excel(forms_data):
                 form_worksheet.write_string(row_idx, col_idx, str(cell_value or ""))
 
     workbook.close()
-    console.log(f"Exported submissions to {path}")
 
 
-#
-async def write_submissions_to_google_spreadsheet(forms_data):
-    scopes = ['https://www.googleapis.com/auth/spreadsheets']
-    credentials = Credentials.from_service_account_file(GOOGLE_CREDENTIALS_PATH, scopes=scopes)
-    client = gspread.authorize(credentials)
-    workbook = client.open_by_key(GOOGLE_SHEET_ID)
+async def write_quick_reports_to_excel(quick_reports):
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    filename = f"quick-reports-{timestamp}.xlsx"
+    path = os.path.join(EXPORT_ROOT, filename)
+
+    workbook = xlsxwriter.Workbook(path)
+
+    quick_reports_worksheet = workbook.add_worksheet("Quick Reports")
+
+    # write data
+    for row_idx, row_data in enumerate(quick_reports):
+        for col_idx, cell_value in enumerate(row_data):
+            quick_reports_worksheet.write_string(row_idx, col_idx, str(cell_value or ""))
+
+    workbook.close()
+
+
+async def write_submissions_to_google_spreadsheet(progress, task_upload_forms, forms_data):
+    workbook = gdocs_client.open_by_key(FS_GOOGLE_DOC_ID)
 
     for sheet_name, data in forms_data.items():
-        # Clean up name and ensure valid length
-        num_rows = max(1000, len(data))
-        num_cols = max(1, len(data[0]) if data else 1)
-
         # Try to get existing worksheet or create a new one
         try:
             worksheet = workbook.worksheet(sheet_name)
             worksheet.clear()
         except gspread.exceptions.WorksheetNotFound:
+            num_rows = max(1000, len(data))
+            num_cols = max(1, len(data[0]) if data else 1)
             worksheet = workbook.add_worksheet(title=sheet_name, rows=num_rows, cols=num_cols)
 
         # Convert all cells to strings
         values = [[str(cell or "") for cell in row] for row in data]
 
-        # 🚀 Bulk update in one request
         worksheet.update(range_name="A1", values=values)
+        progress.update(task_upload_forms, advance=1)
 
-        console.log(f"[green]Updated Google Sheet tab:[/] {sheet_name} ({num_rows} rows, {num_cols} cols)")
+async def write_quick_reports_to_google_spreadsheet(quick_reports):
+    workbook = gdocs_client.open_by_key(QR_GOOGLE_DOC_ID)
+    sheet_name = "Quick Reports"
 
-    console.log("[cyan]All forms successfully uploaded to Google Sheets.[/]")
+    # Try to get existing worksheet or create a new one
+    try:
+        worksheet = workbook.worksheet(sheet_name)
+        worksheet.clear()
+    except gspread.exceptions.WorksheetNotFound:
+        num_rows = max(1000, len(quick_reports))
+        worksheet = workbook.add_worksheet(title=sheet_name, rows=num_rows, cols=100)
 
+    # Convert all cells to strings
+    values = [[str(cell or "") for cell in row] for row in quick_reports]
 
-# Attachment download worker with semaphore
-async def download_submission_attachment_worker(client: httpx.AsyncClient, submission: Dict[str, Any],
-                                                attachment: Dict[str, Any], sem: asyncio.Semaphore) -> None:
-    submission_id = submission["submissionId"]
-    path = local_submission_attachment_path(submission_id, attachment)
+    worksheet.update(range_name="A1", values=values)
+
+async def write_timestamp_to_google_spreadsheet(workbook, timestamp):
+    sheet_name = "Status"
+
+    # Try to get existing worksheet or create a new one
+    try:
+        worksheet = workbook.worksheet(sheet_name)
+    except gspread.exceptions.WorksheetNotFound:
+        worksheet = workbook.add_worksheet(title=sheet_name, rows=1000, cols=10)
+
+    worksheet.update_acell("B3", timestamp)
+
+async def download_submission_attachment_worker(attachment: Dict[str, Any], sem: asyncio.Semaphore, progress, task) -> None:
+    path = local_submission_attachment_path(attachment)
     async with sem:
         try:
-            await download_binary(client, attachment["presignedUrl"], path)
+            await download_binary(attachment["presignedUrl"], path)
+            progress.update(task, advance=1)
         except Exception as e:
-            error_console.log(
-                f"Failed to download attachment {attachment.get('uploadedFileName')} for submission {submission_id}: {e}")
+            error_console.log(f"{e}")
 
+async def download_quick_report_attachment_worker(attachment: Dict[str, Any], sem: asyncio.Semaphore, progress, task) -> None:
+    path = local_quick_report_attachment_path(attachment)
+    async with sem:
+        try:
+            await download_binary(attachment["presignedUrl"], path)
+            progress.update(task, advance=1)
+        except Exception as e:
+            error_console.log(f"{e}")
 
 async def main():
-    if not ELECTION_ID:
-        error_console.log("ELECTION_ID env var not set.")
-        return
-
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
         await log_in(client)
 
         with Progress(console=console, transient=True) as progress:
-            task_overall = progress.add_task("[cyan]Overall progress...", total=4)
+            task_overall = progress.add_task("[cyan]Overall progress...", total=14)
 
-            # 1️⃣ Fetch submission list
-            console.log("Fetching submission list...")
-            submissions_list = await fetch_all_paginated(client)
+            # 1 Fetch submission list
+            submissions_list = await fetch_all_form_submissions(client)
             progress.update(task_overall, advance=1)
 
-            # 2️⃣ Fetch submission details concurrently
+            # 2 Fetch submission details concurrently
             sem_submissions = asyncio.Semaphore(CONCURRENT_WORKERS)
 
             task_submissions = progress.add_task("[green]Fetching submissions...", total=len(submissions_list))
 
-            submission_tasks = [
+            form_submissions_tasks = [
                 fetch_submission_detail(client, s["submissionId"], sem_submissions, progress, task_submissions)
                 for s in submissions_list
             ]
-            submission_details = [r for r in (await asyncio.gather(*submission_tasks)) if r]
+            form_submissions = [r for r in (await asyncio.gather(*form_submissions_tasks)) if r]
             progress.update(task_overall, advance=1)
 
-            # 3️⃣ Fetch distinct forms
-            form_ids = {s.get("formId") for s in submission_details if s.get("formId")}
+            # 3 Fetch distinct forms
+            form_ids = {s.get("formId") for s in form_submissions if s.get("formId")}
 
-            task_forms = progress.add_task("[magenta]Fetching forms...", total=len(form_ids))
+            task_forms = progress.add_task("[green]Fetching forms...", total=len(form_ids))
 
             form_tasks = [fetch_form_detail(client, fid, progress, task_forms) for fid in form_ids]
             forms = [f for f in (await asyncio.gather(*form_tasks)) if f]
             progress.update(task_overall, advance=1)
 
+            # 4 Download forms submissions attachments
             if DOWNLOAD_ATTACHMENTS:
                 sem_attach = asyncio.Semaphore(CONCURRENT_WORKERS)
                 attach_tasks = []
-                for submission in submission_details:
+                total_number_of_attachments = sum(
+                    len(submission.get("attachments", []))
+                    for submission in form_submissions
+                )
+
+                fs_attachments_task = progress.add_task("[green]Fetching form submissions attachments...", total=total_number_of_attachments)
+
+                for submission in form_submissions:
                     for attachment in submission.get("attachments", []):
                         attach_tasks.append(
-                            download_submission_attachment_worker(client, submission, attachment, sem_attach))
+                            download_submission_attachment_worker(attachment, sem_attach, progress, fs_attachments_task))
 
-                submission_details = [r for r in (await asyncio.gather(*submission_tasks)) if r]
-                progress.update(task_overall, advance=1)
+                _ = [r for r in (await asyncio.gather(*attach_tasks)) if r]
+            progress.update(task_overall, advance=1)
 
-            sheets = prepare_data_for_export(forms, submission_details)
+            # 5 Form submissions to spreadsheets
+            submissions_sheets = submissions_to_data_table(forms, form_submissions)
+            progress.update(task_overall, advance=1)
 
-            await write_submissions_to_excel(sheets)
-            await write_submissions_to_google_spreadsheet(sheets)
+            # 6 Write form submissions to excel
+            await write_submissions_to_excel(submissions_sheets)
+            progress.update(task_overall, advance=1)
+
+            # 7 Write form submissions to Google Spreadsheets
+            task_upload_forms = progress.add_task("[green]Write form submissions to Google Spreadsheets...", total=len(form_ids))
+            await write_submissions_to_google_spreadsheet(progress, task_upload_forms, submissions_sheets)
+            progress.update(task_overall, advance=1)
+
+            # 8 Fetch quick reports list
+            quick_reports_list = await fetch_all_quick_reports(client)
+            progress.update(task_overall, advance=1)
+
+            # 9 Fetch quick reports details concurrently
+            sem_quick_reports = asyncio.Semaphore(CONCURRENT_WORKERS)
+
+            task_quick_reports = progress.add_task("[green]Fetching quick reports...", total=len(quick_reports_list))
+
+            quick_reports_tasks = [
+                fetch_quick_report_detail(client, qr["id"], sem_quick_reports, progress, task_quick_reports)
+                for qr in quick_reports_list
+            ]
+            quick_reports_details = [r for r in (await asyncio.gather(*quick_reports_tasks)) if r]
+            progress.update(task_overall, advance=1)
+
+            # 10 Download quick reports attachments
+            if DOWNLOAD_ATTACHMENTS:
+                sem_attach = asyncio.Semaphore(CONCURRENT_WORKERS)
+                attach_tasks = []
+                total_number_of_attachments = sum(
+                    len(qr.get("attachments", []))
+                    for qr in quick_reports_details
+                )
+
+                qr_attachments_task = progress.add_task("[green]Fetching quick reports attachments...",
+                                                        total=total_number_of_attachments)
+
+                for quick_report in quick_reports_details:
+                    for attachment in quick_report.get("attachments", []):
+                        attach_tasks.append(
+                            download_quick_report_attachment_worker(attachment, sem_attach, progress, qr_attachments_task))
+
+                _ = [r for r in (await asyncio.gather(*attach_tasks)) if r]
+
+            progress.update(task_overall, advance=1)
+
+            # 11 Quick reports to spreadsheets
+            quick_reports_sheet = quick_reports_to_data_table(quick_reports_details)
+            progress.update(task_overall, advance=1)
+
+            # 12 Write quick reports to excel
+            await write_quick_reports_to_excel(quick_reports_sheet)
+            progress.update(task_overall, advance=1)
+
+            # 13 Write quick reports to Google Spreadsheets
+            await write_quick_reports_to_google_spreadsheet(quick_reports_sheet)
+            progress.update(task_overall, advance=1)
+
+            fs_workbook = gdocs_client.open_by_key(FS_GOOGLE_DOC_ID)
+            qr_workbook = gdocs_client.open_by_key(QR_GOOGLE_DOC_ID)
+
+            timestamp = datetime.now(ZONE_INFO).strftime("%Y-%m-%d %H:%M:%S")
+            await write_timestamp_to_google_spreadsheet(fs_workbook, timestamp)
+            await write_timestamp_to_google_spreadsheet(qr_workbook, timestamp)
             progress.update(task_overall, advance=1)
 
 
