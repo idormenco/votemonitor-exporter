@@ -134,6 +134,20 @@ async def fetch_form_detail(client: httpx.AsyncClient, form_id: str, progress,
     progress.update(task, advance=1)
     return form
 
+async def fetch_all_forms(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
+    url = urljoin(BASE_API_URL, f"/api/election-rounds/{ELECTION_ID}/forms")
+    params = {"pageNumber": 1, "pageSize": 100, "dataSource": "Coalition"}
+    resp = await client.get(url, params=params)
+    resp.raise_for_status()
+    data = resp.json()
+    forms = [item for item in data.get("items", []) if item.get("status") != "Drafted"]
+    
+
+    # temp workaround to fetch form details for PSI
+    forms.append({"id":'d4a0c5ca-4dbd-47c0-8854-ba8cb2adbe10'})
+
+    return forms
+
 
 async def fetch_quick_report_detail(client: httpx.AsyncClient, quick_report_id: str, sem: asyncio.Semaphore, progress,
                                     task) -> Dict[str, Any]:
@@ -147,16 +161,15 @@ async def fetch_quick_report_detail(client: httpx.AsyncClient, quick_report_id: 
             error_console.log(f"Failed to download submission {quick_report_id}: {e}")
 
 
-async def fetch_all_form_submissions(client: httpx.AsyncClient, params_extra: Optional[Dict[str, Any]] = None) -> List[
+async def fetch_all_form_submissions(client: httpx.AsyncClient) -> List[
     Dict[str, Any]]:
     url = urljoin(BASE_API_URL, f"/api/election-rounds/{ELECTION_ID}/form-submissions:byEntry")
 
     page_number = 1
     page_size = 100
     form_submissions: List[Dict[str, Any]] = []
-    params_extra = params_extra or {}
     while True:
-        params = {**params_extra, "pageNumber": page_number, "pageSize": page_size, "dataSource": "Coalition"}
+        params = {"pageNumber": page_number, "pageSize": page_size, "dataSource": "Coalition"}
         resp = await client.get(url, params=params)
         resp.raise_for_status()
         data = resp.json()
@@ -168,16 +181,15 @@ async def fetch_all_form_submissions(client: httpx.AsyncClient, params_extra: Op
     return form_submissions
 
 
-async def fetch_all_quick_reports(client: httpx.AsyncClient, params_extra: Optional[Dict[str, Any]] = None) -> List[
+async def fetch_all_quick_reports(client: httpx.AsyncClient) -> List[
     Dict[str, Any]]:
     url = urljoin(BASE_API_URL, f"/api/election-rounds/{ELECTION_ID}/quick-reports")
 
     page_number = 1
     page_size = 100
     quick_reports: List[Dict[str, Any]] = []
-    params_extra = params_extra or {}
     while True:
-        params = {**params_extra, "pageNumber": page_number, "pageSize": page_size, "dataSource": "Coalition"}
+        params = {"pageNumber": page_number, "pageSize": page_size, "dataSource": "Coalition"}
         resp = await client.get(url, params=params)
         resp.raise_for_status()
         data = resp.json()
@@ -347,13 +359,14 @@ def submissions_to_data_table(forms: List[Dict[str, Any]], submissions: List[Dic
             form_headers.append("Attachments")
 
         form_submissions = [sub for sub in submissions if sub.get("formId") == form.get("id")]
+        form_submissions.sort(key=lambda x: x.get("timeSubmitted", ""))
 
         data = [form_headers]
         for fs in form_submissions:
             timeSubmitted_utc = datetime.fromisoformat(fs.get("timeSubmitted", "").replace("Z", "+00:00"))
 
             # Convert from UTC to specified timezone
-            timeSubmitted = timeSubmitted_utc.astimezone(ZONE_INFO)
+            timeSubmitted = timeSubmitted_utc.astimezone(ZONE_INFO).strftime("%Y-%m-%d %H:%M:%S")
             row_data = [
                 fs.get("submissionId", ""),
                 timeSubmitted,
@@ -417,13 +430,14 @@ def quick_reports_to_data_table(quick_reports):
         "Description",
         "Attachments",
     ]]
+    quick_reports.sort(key=lambda x: x.get("timestamp", ""))
 
     for qr in quick_reports:
         attachments = "\n\n".join(map(lambda a: a["presignedUrl"], qr.get("attachments", [])))
         timeSubmitted_utc = datetime.fromisoformat(qr.get("timestamp", "").replace("Z", "+00:00"))
 
         # Convert from UTC to specified timezone
-        timeSubmitted = timeSubmitted_utc.astimezone(ZONE_INFO)
+        timeSubmitted = timeSubmitted_utc.astimezone(ZONE_INFO).strftime("%Y-%m-%d %H:%M:%S")
         row_data = [
             qr.get("id", ""),
             timeSubmitted,
@@ -574,11 +588,11 @@ async def main():
             progress.update(task_overall, advance=1)
 
             # 3 Fetch distinct forms
-            form_ids = {s.get("formId") for s in form_submissions if s.get("formId")}
+            forms = await fetch_all_forms(client)
 
-            task_forms = progress.add_task("[green]Fetching forms...", total=len(form_ids))
+            task_forms = progress.add_task("[green]Fetching form details...", total=len(forms))
 
-            form_tasks = [fetch_form_detail(client, fid, progress, task_forms) for fid in form_ids]
+            form_tasks = [fetch_form_detail(client, form.get("id"), progress, task_forms) for form in forms]
             forms = [f for f in (await asyncio.gather(*form_tasks)) if f]
             progress.update(task_overall, advance=1)
 
@@ -610,7 +624,7 @@ async def main():
             progress.update(task_overall, advance=1)
 
             # 7 Write form submissions to Google Spreadsheets
-            task_upload_forms = progress.add_task("[green]Write form submissions to Google Spreadsheets...", total=len(form_ids))
+            task_upload_forms = progress.add_task("[green]Write form submissions to Google Spreadsheets...", total=len(forms))
             await write_submissions_to_google_spreadsheet(progress, task_upload_forms, submissions_sheets)
             progress.update(task_overall, advance=1)
 
